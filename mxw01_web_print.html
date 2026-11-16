@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#172033"><title>MXW01 Web Print</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f5f8;color:#172033;font:16px system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:760px;margin:auto;padding:18px}h1{font-size:1.45rem;margin:4px 0}
+.panel{background:white;border:1px solid #dce2ea;border-radius:14px;padding:16px;margin:14px 0}
+button,.filebtn{border:0;border-radius:10px;padding:12px 16px;font:inherit;font-weight:600;background:#185abd;color:white;cursor:pointer}
+button.secondary{background:#e7edf6;color:#172033}button:disabled{opacity:.5}
+textarea,input{font:inherit;width:100%;padding:11px;border:1px solid #c8d1dd;border-radius:9px;background:white;color:#172033}
+textarea{min-height:130px;resize:vertical}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.muted{color:#586579;font-size:.9rem}
+label{display:block;font-weight:600;margin:10px 0 5px}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+#canvas{display:block;width:min(100%,384px);height:auto;max-height:380px;object-fit:contain;background:white;border:1px solid #ccd3dc;margin:10px auto}
+#log{white-space:pre-wrap;overflow-wrap:anywhere;max-height:240px;overflow:auto;background:#111827;color:#d8e2f0;padding:12px;border-radius:10px;font:12px ui-monospace,monospace}
+.status{font-weight:700;margin-top:8px}.warning{background:#fff4db;border:1px solid #e9d39d;padding:12px;border-radius:10px;font-size:.9rem}
+input[type=range]{padding:0}input[type=file]{border:0;padding:6px 0}
+</style></head>
+<body><main>
+<h1>MXW01 — печать через Bluetooth</h1>
+<p class="muted">Веб-печать v1.8 для MXW01. Текст, изображения и PDF (все страницы). Работает в Chrome на Android через BLE.</p>
+<div class="panel">
+ <div class="row"><button id="connect">Подключить MXW01</button><button class="secondary" id="disconnect" disabled>Отключить</button></div>
+ <div class="status" id="status">Не подключено</div>
+ <p class="muted" id="deviceName">Принтер не выбран</p>
+</div>
+<div class="panel">
+ <h3>Содержимое печати</h3>
+ <label for="txt">Текст</label><textarea id="txt" placeholder="Введите текст для печати">Тест печати MXW01</textarea>
+ <div class="grid">
+  <div><label for="size">Размер текста</label><input id="size" type="number" min="12" max="48" value="24"></div>
+  <div><label for="dark">Плотность (порог)</label><input id="dark" type="range" min="70" max="210" value="160"><div class="muted">Порог: <span id="darkv">160</span></div></div>
+ </div>
+ <label for="file">Изображение (PNG/JPG)</label><input id="file" type="file" accept="image/*">
+ <label for="pdffile">Или документ PDF (печать всех страниц)</label><input id="pdffile" type="file" accept="application/pdf,.pdf">
+ <p class="muted" id="pdfInfo">PDF не выбран</p>
+ <div class="row"><button class="secondary" id="render">Обновить предпросмотр</button><button class="secondary" id="clearImg">Сбросить изображение</button></div>
+ <canvas id="canvas" width="384" height="160"></canvas>
+ <p class="muted" id="dimensions">Ширина печати: 384 точки (около 48 мм). Высота зависит от содержимого.</p>
+ <button id="print" disabled>ПЕЧАТАТЬ</button>
+</div>
+<div class="panel">
+ <h3>Журнал</h3><pre id="log">Подключите принтер, чтобы начать.</pre>
+</div>
+<div class="warning">Перед первой печатью проверьте бумагу и крышку. Начните с короткого теста. Протокол MXW01 частично документирован сторонними разработчиками; используйте на свой риск. Не отправляйте длинные задания, пока короткий тест не пройдёт успешно.</div>
+<p class="muted">Текст, изображения и содержимое PDF обрабатываются локально в браузере. Для чтения PDF библиотека PDF.js загружается с CDN; сам PDF-файл на сервер не отправляется.</p>
+</main>
+<script>
+const UUID={service:'0000ae30-0000-1000-8000-00805f9b34fb',ctrl:'0000ae01-0000-1000-8000-00805f9b34fb',notify:'0000ae02-0000-1000-8000-00805f9b34fb',data:'0000ae03-0000-1000-8000-00805f9b34fb'};
+let dev=null,ctrl=null,rx=null,dataChar=null,notifications=[],busy=false,imageMode=false,loadedImage=null,pdfPages=[],pdfMode=false;
+const $=id=>document.getElementById(id);
+function log(s){$('log').textContent+=s+'\n';$('log').scrollTop=$('log').scrollHeight}
+function setStatus(s){$('status').textContent=s}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+if(window.pdfjsLib){pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';}
+function crc8(bytes){let crc=0;for(const b of bytes){crc^=b;for(let i=0;i<8;i++)crc=(crc&0x80)?((crc<<1)^0x07)&255:(crc<<1)&255;}return crc}
+function frame(cmd,payload){const out=new Uint8Array(8+payload.length);out.set([0x22,0x21,cmd,0,payload.length&255,(payload.length>>8)&255]);out.set(payload,6);out[6+payload.length]=crc8(payload);out[7+payload.length]=0xff;return out}
+function parseNotification(bytes){if(bytes.length<7)return null;if(bytes[0]!==0x22||bytes[1]!==0x21)return null;const n=bytes[4]|(bytes[5]<<8);return {cmd:bytes[2],payload:bytes.slice(6,6+n),raw:bytes}}
+function waitForCommand(cmd,timeout=5000){return new Promise((resolve,reject)=>{const start=Date.now();const poll=()=>{const i=notifications.findIndex(x=>x.cmd===cmd);if(i>=0)return resolve(notifications.splice(i,1)[0]);if(Date.now()-start>timeout)return reject(new Error('Нет ответа от принтера на команду 0x'+cmd.toString(16).toUpperCase()));setTimeout(poll,100)};poll()})}
+async function sendControl(cmd,payload){await ctrl.writeValueWithoutResponse(frame(cmd,new Uint8Array(payload)))}
+async function connect(){try{
+ if(!navigator.bluetooth)throw Error('Web Bluetooth не поддерживается этим браузером. Используйте Chrome на Android.');
+ setStatus('Выберите MXW01 в системном окне…');
+ dev=await navigator.bluetooth.requestDevice({filters:[{name:'MXW01'}],optionalServices:[UUID.service]});
+ dev.addEventListener('gattserverdisconnected',()=>{setStatus('Соединение потеряно');$('connect').disabled=false;$('disconnect').disabled=true;$('print').disabled=true;ctrl=rx=dataChar=null});
+ const server=await dev.gatt.connect();const svc=await server.getPrimaryService(UUID.service);
+ ctrl=await svc.getCharacteristic(UUID.ctrl);rx=await svc.getCharacteristic(UUID.notify);dataChar=await svc.getCharacteristic(UUID.data);
+ await rx.startNotifications();rx.addEventListener('characteristicvaluechanged',e=>{const v=e.target.value;const b=new Uint8Array(v.buffer,v.byteOffset,v.byteLength);const p=parseNotification(b);if(p){notifications.push(p);log('RX '+hex(b));}else log('RX raw '+hex(b));});
+ $('deviceName').textContent='Подключено: '+(dev.name||'MXW01');$('connect').disabled=true;$('disconnect').disabled=false;$('print').disabled=false;setStatus('Подключено к MXW01');log('Подключено. AE01/AE02/AE03 готовы.');
+ }catch(e){setStatus('Ошибка подключения');log('ОШИБКА: '+e.message);$('connect').disabled=false}}
+function hex(b){return [...b].map(x=>x.toString(16).padStart(2,'0')).join(' ')}
+function makePreview(){
+ const c=$('canvas'),ctx=c.getContext('2d');let h=160;
+ if(pdfMode && pdfPages.length){h=pdfPages[0].height;}
+ else if(loadedImage){const ratio=loadedImage.height/loadedImage.width;h=Math.max(1,Math.min(3000,Math.round(384*ratio)));}
+ else {const lines=$('txt').value.split('\n');const fs=Math.max(12,Math.min(48,Number($('size').value)||24));h=Math.max(100,Math.ceil(lines.length*fs*1.45+30));}
+ c.width=384;c.height=h;ctx.fillStyle='white';ctx.fillRect(0,0,384,h);
+ if(pdfMode && pdfPages.length){ctx.drawImage(pdfPages[0],0,0,384,h);}
+ else if(loadedImage){const scale=Math.min(384/loadedImage.width,3000/loadedImage.height);const w=Math.round(loadedImage.width*scale),hh=Math.round(loadedImage.height*scale);ctx.drawImage(loadedImage,0,0,w,hh);}
+ else {const fs=Math.max(12,Math.min(48,Number($('size').value)||24));ctx.fillStyle='black';ctx.font=`${fs}px sans-serif`;ctx.textBaseline='top';let y=12;for(const line of $('txt').value.split('\n')){const words=line.split(' ');let current='';for(const word of words){const test=current?current+' '+word:word;if(ctx.measureText(test).width>360&&current){ctx.fillText(current,12,y);y+=fs*1.35;current=word;}else current=test;}ctx.fillText(current,12,y);y+=fs*1.35;}}
+ $('dimensions').textContent=`384 × ${h} точек · ${Math.ceil(h/8)} байт-строк`;
+}
+function rasterize(sourceCanvas=$('canvas')){
+ const c=sourceCanvas,ctx=c.getContext('2d'),h=c.height;
+ const im=ctx.getImageData(0,0,384,h).data;
+ const threshold=Number($('dark').value);
+ // Построчный растр: 384 точки по X = 48 байт на каждую строку Y.
+ // В каждом байте старший бит соответствует левому пикселю.
+ const out=new Uint8Array(h*48);
+ let darkPixels=0,minLum=255,maxLum=0;
+ for(let y=0;y<h;y++){
+   for(let x=0;x<384;x++){
+     const i=(y*384+x)*4;
+     const lum=im[i]*.299+im[i+1]*.587+im[i+2]*.114;
+     if(lum<threshold){
+       out[y*48+Math.floor(x/8)] |= (1 << (x%8));
+       darkPixels++;
+     }
+     if(lum<minLum)minLum=lum;
+     if(lum>maxLum)maxLum=lum;
+   }
+ }
+ const nonZero=out.reduce((n,b)=>n+(b!==0?1:0),0);
+ log(`Canvas: ${c.width}x${h}; тёмных пикселей=${darkPixels}; яркость min/max=${minLum.toFixed(0)}/${maxLum.toFixed(0)}; threshold=${threshold}`);
+ log(`Растр: ${h} горизонтальных строк по 48 байт (младший бит первым); ненулевых байтов=${nonZero}; первые 24 байта: ${hex(out.slice(0,24))}`);
+ return {bytes:out,rows:h};
+}
+function loadImage(file){return new Promise((resolve,reject)=>{const url=URL.createObjectURL(file),im=new Image();im.onload=()=>{URL.revokeObjectURL(url);resolve(im)};im.onerror=reject;im.src=url})}
+async function loadPdf(file){
+ if(!window.pdfjsLib)throw Error('Не удалось загрузить PDF.js. Проверьте интернет и обновите страницу.');
+ pdfPages=[];pdfMode=true;loadedImage=null;$('file').value='';
+ const data=new Uint8Array(await file.arrayBuffer());
+ const doc=await pdfjsLib.getDocument({data}).promise;
+ if(doc.numPages>100)throw Error('В документе больше 100 страниц. Для безопасности выберите PDF до 100 страниц.');
+ for(let n=1;n<=doc.numPages;n++){
+   const page=await doc.getPage(n);
+   const base=page.getViewport({scale:1});
+   const viewport=page.getViewport({scale:384/base.width});
+   const canvas=document.createElement('canvas');
+   canvas.width=384;canvas.height=Math.max(1,Math.min(3000,Math.ceil(viewport.height)));
+   const ctx=canvas.getContext('2d');
+   ctx.fillStyle='#fff';ctx.fillRect(0,0,canvas.width,canvas.height);
+   await page.render({canvasContext:ctx,viewport}).promise;
+   pdfPages.push(canvas);
+   $('pdfInfo').textContent=`PDF: ${doc.numPages} стр. Загружено ${n}/${doc.numPages}`;
+ }
+ $('pdfInfo').textContent=`PDF загружен: ${doc.numPages} стр. Будут напечатаны все страницы.`;
+ makePreview();
+}
+
+async function sendRasterJob(raster, totalRows, pageLabel=''){
+ const nonZero=raster.reduce((n,b)=>n+(b!==0?1:0),0);
+ log(`\n${pageLabel}Задание: ${totalRows} строк, ${raster.length} байт.`);
+ log(`Ненулевых байтов растра: ${nonZero}; первые 24 байта: ${hex(raster.slice(0,24))}`);
+ if(nonZero===0)throw Error('Растр полностью белый: нечего печатать.');
+ await sendControl(0xA2,[0xFF]);log('Интенсивность установлена: FF.');
+ await sendControl(0xA1,[0x00]);
+ try{const st=await waitForCommand(0xA1,2500);log('Ответ статуса получен: '+hex(st.payload));}
+ catch(e){log('Предупреждение: статус не получен; продолжаю по команде пользователя.');}
+ await sendControl(0xA9,[totalRows&255,(totalRows>>8)&255,0x30,0x00]);
+ const ack=await waitForCommand(0xA9,5000);
+ if(!ack.payload.length||ack.payload[0]!==0)throw Error('Принтер не подтвердил начало печати: '+hex(ack.payload));
+ log('Старт печати подтверждён.');
+ const chunk=48;
+ for(let off=0;off<raster.length;off+=chunk){
+   await dataChar.writeValueWithoutResponse(raster.slice(off,off+chunk));
+   if(off%(chunk*10)===0)setStatus(`Передача данных: ${Math.min(100,Math.round((off+chunk)/raster.length*100))}%`);
+   await sleep(12);
+ }
+ await sendControl(0xAD,[0x00]);log('Данные отправлены, команда завершения передана.');
+ setStatus('Ожидание завершения печати…');
+ const done=await waitForCommand(0xAA,30000);
+ log('Принтер прислал AA: '+hex(done.payload));
+}
+async function printJob(){
+ log('НАЖАТИЕ: обработчик кнопки вызван.');
+ log('Состояние: busy='+busy+', AE01='+(!!ctrl)+', AE03='+(!!dataChar)+', GATT='+(!!(dev&&dev.gatt&&dev.gatt.connected)));
+ if(busy){log('Печать уже выполняется.');return;}
+ if(!ctrl||!dataChar||!dev||!dev.gatt.connected){log('Нет активного BLE-соединения. Переподключите принтер.');setStatus('Нет активного соединения');return;}
+ busy=true;$('print').disabled=true;notifications=[];
+ try{
+   makePreview();
+   if(pdfMode && pdfPages.length){
+     for(let i=0;i<pdfPages.length;i++){
+       const {bytes,rows}=rasterize(pdfPages[i]);
+       setStatus(`Печать PDF: страница ${i+1}/${pdfPages.length}`);
+       await sendRasterJob(bytes,rows,`PDF ${i+1}/${pdfPages.length}. `);
+     }
+     setStatus(`PDF напечатан: ${pdfPages.length} стр.`);
+     log(`PDF: завершена печать ${pdfPages.length} страниц.`);
+   }else{
+     const {bytes,rows}=rasterize();
+     await sendRasterJob(bytes,rows);
+     setStatus('Принтер сообщил о завершении задания.');
+   }
+ }catch(e){
+   setStatus('Печать прервана / не подтверждена');
+   log('ОШИБКА ПЕЧАТИ: '+e.message+'\nЕсли принтер начал печатать, не повторяйте задание до проверки бумаги.');
+ }finally{busy=false;$('print').disabled=!ctrl}
+}
+$('connect').onclick=connect;
+$('print').addEventListener('click',()=>{log('Событие click получено кнопкой ПЕЧАТАТЬ.');printJob().catch(e=>{log('Необработанная ошибка: '+e.message);setStatus('Ошибка');});});
+$('print').onclick=()=>{ /* резервный обработчик */ };
+$('disconnect').onclick=()=>{if(dev?.gatt?.connected)dev.gatt.disconnect();};
+$('render').onclick=()=>{makePreview();log('Предпросмотр обновлён.')};
+$('clearImg').onclick=()=>{loadedImage=null;pdfPages=[];pdfMode=false;$('file').value='';$('pdffile').value='';$('pdfInfo').textContent='PDF не выбран';makePreview()};
+$('file').onchange=async e=>{const f=e.target.files[0];if(f){try{pdfPages=[];pdfMode=false;$('pdffile').value='';$('pdfInfo').textContent='PDF не выбран';loadedImage=await loadImage(f);makePreview()}catch(err){log('Не удалось открыть изображение: '+err.message)}}};
+$('pdffile').onchange=async e=>{const f=e.target.files[0];if(f){try{loadedImage=null;await loadPdf(f)}catch(err){pdfPages=[];pdfMode=false;$('pdfInfo').textContent='Ошибка загрузки PDF';log('Не удалось открыть PDF: '+err.message)}}};
+$('dark').oninput=e=>$('darkv').textContent=e.target.value;
+$('txt').oninput=()=>{if(!loadedImage)makePreview()};
+$('size').onchange=()=>{if(!loadedImage)makePreview()};
+makePreview();
+</script></body></html>
